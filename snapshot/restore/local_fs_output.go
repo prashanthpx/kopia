@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
+	"syscall"
 
 	"github.com/pkg/errors"
 
@@ -133,7 +134,7 @@ func (o *FilesystemOutput) Parallelizable() bool {
 // BeginDirectory implements restore.Output interface.
 func (o *FilesystemOutput) BeginDirectory(ctx context.Context, relativePath string, _ fs.Directory) error {
 	path := filepath.Join(o.TargetPath, filepath.FromSlash(relativePath))
-
+	log(ctx).Infof(" line 137 path: %v, relativePath: %v, TargetPath: %v", path, relativePath, o.TargetPath)
 	if err := o.createDirectory(ctx, path); err != nil {
 		return errors.Wrap(err, "error creating directory")
 	}
@@ -165,13 +166,28 @@ func (o *FilesystemOutput) Close(ctx context.Context) error {
 
 // WriteFile implements restore.Output interface.
 func (o *FilesystemOutput) WriteFile(ctx context.Context, relativePath string, f fs.File, progressCb FileWriteProgress) error {
-	log(ctx).Debugf("WriteFile %v (%v bytes) %v, %v", filepath.Join(o.TargetPath, relativePath), f.Size(), f.Mode(), f.ModTime())
-	path := filepath.Join(o.TargetPath, filepath.FromSlash(relativePath))
+	log(ctx).Infof(" o.TargetPath: %v, relativePath: %v", o.TargetPath, relativePath)
+	log(ctx).Infof("WriteFile %v (%v bytes) %v, %v", filepath.Join(o.TargetPath, relativePath), f.Size(), f.Mode(), f.ModTime())
+	// path := filepath.Join(o.TargetPath, filepath.FromSlash(relativePath))
 
-	if err := o.copyFileContent(ctx, path, f, progressCb); err != nil {
-		return errors.Wrap(err, "error creating file")
+	// fileInfo, err := os.Lstat(path)
+	fileInfo, err := os.Lstat(o.TargetPath)
+	if err != nil {
+		return errors.Wrapf(err, "unable to get the target device information for %s", o.TargetPath)
 	}
-
+	path := o.TargetPath
+	log(ctx).Debugf("block mode fileInfo: %v", fileInfo)
+	if (fileInfo.Sys().(*syscall.Stat_t).Mode & syscall.S_IFMT) != syscall.S_IFBLK {
+		if err := o.copyFileContent(ctx, path, f, progressCb); err != nil {
+			return errors.Wrap(err, "error creating file")
+		}
+	} else {
+		log(ctx).Debugf("line 182 entering block mode code")
+		if err := o.copyBlockFileContent(ctx, path, f, progressCb); err != nil {
+			return errors.Wrap(err, "error creating block file")
+		}
+	}
+	
 	if err := o.setAttributes(path, f, os.FileMode(0)); err != nil {
 		return errors.Wrap(err, "error setting attributes")
 	}
@@ -369,6 +385,10 @@ func (o *FilesystemOutput) createDirectory(ctx context.Context, path string) err
 		log(ctx).Debugf("Not creating already existing directory: %v", path)
 
 		return nil
+	case (st.Sys().(*syscall.Stat_t).Mode & syscall.S_IFMT == syscall.S_IFBLK):
+		log(ctx).Debugf("Device file exists...")
+		return nil
+
 	default:
 		return errors.Errorf("unable to create directory, %q already exists and it is not a directory", path)
 	}
@@ -433,6 +453,69 @@ func (o *FilesystemOutput) copyFileContent(ctx context.Context, targetPath strin
 
 	return write(targetPath, rr, f.Size(), o.copier)
 }
+
+const bufferSize = 128 * 1024
+
+func (o *FilesystemOutput) copyBlockFileContent(ctx context.Context, targetPath string, f fs.File, progressCb FileWriteProgress) error {
+	switch _, err := os.Stat(targetPath); {
+	case os.IsNotExist(err): // copy file below
+	case err == nil:
+		if !o.OverwriteFiles {
+			return errors.Errorf("unable to create %q, it already exists", targetPath)
+		}
+
+		log(ctx).Debugf("Overwriting existing file: %v", targetPath)
+	default:
+		return errors.Wrap(err, "failed to stat "+targetPath)
+	}
+
+	r, err := f.Open(ctx)
+	if err != nil {
+		return errors.Wrap(err, "unable to open snapshot file for "+targetPath)
+	}
+	defer r.Close() //nolint:errcheck
+
+	/*rr := &progressReportingReader{
+		Reader: r,
+		cb:     progressCb,
+	}
+	*/
+
+	log(ctx).Debugf("copying file contents to: %v", targetPath)
+	targetFile, err := os.Create(targetPath)
+	if err != nil {
+		return errors.Wrapf(err, "failed to open file %s", targetPath)
+	}
+	defer targetFile.Close()
+
+	buffer := make([]byte, bufferSize)
+	readData := true
+	for readData {
+		bytesToWrite, err := r.Read(buffer)
+		if err != nil {
+			if err != io.EOF {
+				return errors.Wrapf(err, "failed to read data from remote file %s", targetPath)
+			}
+			readData = false
+		}
+
+		if bytesToWrite > 0 {
+			offset := 0
+			for bytesToWrite > 0 {
+				if bytesWritten, err := targetFile.Write(buffer[offset:bytesToWrite]); err == nil {
+					progressCb(int64(bytesWritten))
+					bytesToWrite -= bytesWritten
+					offset += bytesWritten
+				} else {
+					return errors.Wrapf(err, "failed to write data to file %s", targetPath)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 
 func isEmptyDirectory(name string) (bool, error) {
 	f, err := os.Open(name) //nolint:gosec

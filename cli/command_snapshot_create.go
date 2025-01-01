@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"os"
+	"syscall"
 
 	"github.com/pkg/errors"
 
@@ -43,6 +45,7 @@ type commandSnapshotCreate struct {
 	flushPerSource                        bool
 	sourceOverride                        string
 	sendSnapshotReport                    bool
+	blockMode							  bool
 
 	pins []string
 
@@ -75,6 +78,7 @@ func (c *commandSnapshotCreate) setup(svc appServices, parent commandParent) {
 	cmd.Flag("flush-per-source", "Flush writes at the end of each source").Hidden().BoolVar(&c.flushPerSource)
 	cmd.Flag("override-source", "Override the source of the snapshot.").StringVar(&c.sourceOverride)
 	cmd.Flag("send-snapshot-report", "Send a snapshot report notification using configured notification profiles").Default("true").BoolVar(&c.sendSnapshotReport)
+	cmd.Flag("block-mode", "Block mode snaoshot.").Short('c').BoolVar(&c.blockMode)
 
 	c.logDirDetail = -1
 	c.logEntryDetail = -1
@@ -512,8 +516,14 @@ func (c *commandSnapshotCreate) getContentToSnapshot(ctx context.Context, dir st
 			UserName: rep.ClientOptions().Username,
 		}
 	}
-
-	if c.snapshotCreateStdinFileName != "" {
+	var bErr error
+	// DBG for block mode
+	if c.blockMode {
+		fsEntry, bErr = getLocalBlockEntry(absDir)
+		if err != nil {
+			return nil, info, false, errors.Wrap(bErr, "unable to get local block device entry")
+		}
+	} else if c.snapshotCreateStdinFileName != "" {
 		// stdin source will be snapshotted using a virtual static root directory with a single streaming file entry
 		// Create a new static directory with the given name and add a streaming file entry with os.Stdin reader
 		fsEntry = virtualfs.NewStaticDirectory(absDir, []fs.Entry{
@@ -528,6 +538,31 @@ func (c *commandSnapshotCreate) getContentToSnapshot(ctx context.Context, dir st
 	}
 
 	return fsEntry, info, setManual, nil
+}
+
+const ErrNotPermitted = "operation not permitted"
+
+func getLocalBlockEntry(sourcePath string) (fs.Entry, error) {
+	
+	fileInfo, err := os.Lstat(sourcePath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to get the source device information %s", sourcePath)
+	}
+
+	if (fileInfo.Sys().(*syscall.Stat_t).Mode & syscall.S_IFMT) != syscall.S_IFBLK {
+		return nil, errors.Errorf("source path %s is not a block device", sourcePath)
+	}
+
+	device, err := os.Open(sourcePath)
+	if err != nil {
+		if os.IsPermission(err) || err.Error() == ErrNotPermitted {
+			return nil, errors.Wrapf(err, "no permission to open the source device %s, make sure that node agent is running in privileged mode", sourcePath)
+		}
+		return nil, errors.Wrapf(err, "unable to open the source device %s", sourcePath)
+	}
+
+	sf := virtualfs.StreamingFileFromReader(sourcePath, device)
+	return virtualfs.NewStaticDirectory(sourcePath, []fs.Entry{sf}), nil
 }
 
 func parseFullSource(str, hostname, username string) (snapshot.SourceInfo, error) {
